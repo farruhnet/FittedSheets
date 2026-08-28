@@ -16,6 +16,14 @@ public class SheetTransition: NSObject, UIViewControllerAnimatedTransitioning {
     
     /// Cache of presenters so we can do the experimental shrinkingNestedPresentingViewControllers behavior
     static var currentPresenters: [UIViewController] = []
+
+    /// Presenters currently mid-restore. Guards against two overlapping
+    /// dismiss transitions (e.g. a user-initiated animated dismiss racing
+    /// with a forced non-animated one, such as from
+    /// applicationDidEnterBackground) both animating/laying out the same
+    /// presenter's view at once. That race is what causes the
+    /// NSISEngine "not possible to remove variable" crash.
+    private static var presentersBeingRestored: Set<ObjectIdentifier> = []
     
     init(options: SheetOptions) {
         self.options = options
@@ -105,6 +113,28 @@ public class SheetTransition: NSObject, UIViewControllerAnimatedTransitioning {
 
     func restorePresentor(_ presenter: UIViewController, animated: Bool = true, animations: (() -> Void)? = nil, completion: ((Bool) -> Void)? = nil) {
         SheetTransition.currentPresenters.removeAll(where: { $0 == presenter })
+
+        // If the presenter's view has already been torn out of its window
+        // (e.g. a concurrent forced dismiss got there first), don't animate
+        // or lay out a detached view — just run the caller's side effects
+        // and complete immediately.
+        guard presenter.view.window != nil else {
+            animations?()
+            completion?(true)
+            return
+        }
+
+        // If another restore is already running for this presenter, don't
+        // start a second one that would fight over the same view's
+        // constraint engine — just complete so the caller's transition
+        // context isn't left hanging.
+        let presenterID = ObjectIdentifier(presenter)
+        guard !SheetTransition.presentersBeingRestored.contains(presenterID) else {
+            completion?(true)
+            return
+        }
+        SheetTransition.presentersBeingRestored.insert(presenterID)
+
         let topSafeArea = UIApplication.shared.windows.filter {$0.isKeyWindow}.first?.compatibleSafeAreaInsets.top ?? 0
         UIView.animate(
             withDuration: self.options.transitionDuration,
@@ -124,8 +154,16 @@ public class SheetTransition: NSObject, UIViewControllerAnimatedTransitioning {
                 }
                 animations?()
             },
-            completion: {
-                completion?($0)
+            completion: { finished in
+                SheetTransition.presentersBeingRestored.remove(presenterID)
+
+                // Re-check right before handing back control — the view's
+                // state can change during the animation itself.
+                guard presenter.view.window != nil else {
+                    completion?(true)
+                    return
+                }
+                completion?(finished)
             }
         )
     }
